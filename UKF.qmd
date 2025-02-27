@@ -1,0 +1,264 @@
+---
+title: "UKF"
+author: UniSA Math Clinic
+date: today
+format: pdf
+---
+
+
+```{python}
+import os
+import csv
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from filterpy.kalman import UnscentedKalmanFilter, MerweScaledSigmaPoints
+
+# -----------------------------------------------------------------------------
+# Script to interpolate elevation data into multiple train logs
+# -----------------------------------------------------------------------------
+# This script reads multiple train data logs and their corresponding elevation 
+# data, interpolates the elevation data into each train log based on the 
+# "Distance (km)" column.
+#
+# For each log:
+# - Elevation is interpolated from the corresponding elevation file.
+# - Speed in m/s is calculated from speed in km/h.
+# - Control column is calculated based on Dynamic brake and Notch values.
+# - Gradient force is computed for each distance point.
+#
+# 
+# -----------------------------------------------------------------------------
+
+
+
+# Constant
+g = 9.8  # m/s²
+# power at the wheel
+notch_power = [1000*p for p in [0, 25, 217, 380, 615, 990, 1393, 1939, 2208]]
+
+
+
+# Read the train journeys data
+trains = pd.read_csv("../data/trains.tsv", delimiter="\t")
+
+# Resistance force calculation function
+def r(train, v):
+    return train["r0"] + train["r1"]*v + train["r2"]*v*v
+
+
+# Function to calculate gradient force for a freight train
+def gradient_force(xf, log_data, train):
+    l = train["Train length (m)"]
+    m = train['Train mass (tonnes)'] * 1000  # Convert tonnes to kg
+    xr = xf - l/1000 # Rear of the train in kilometers
+    
+    # Interpolate elevation values at xf and xr
+    hf = np.interp(xf, log_data["Distance (km)"], log_data["Elevation (m)"]) # Elevation at the front
+    hr = np.interp(xr, log_data["Distance (km)"], log_data["Elevation (m)"]) # Elevation at the rear
+    
+    # Calculate the gradient force
+    gradient = (hf - hr) / l  # Gradient in m/m (dimensionless slope)
+    g_force = -m * 9.8 * gradient  # Gradient force in Newtons
+    
+    return g_force
+
+# The power function p(u) 
+def p(u):
+    if u > 0:
+        result = nlocos*1000*(1971*u**2 + 341.3*u)
+    else:
+        result = nlocos*2000*u # The magnitude of 2000 is a rough estimate, which can be adjusted based on how aggressive the braking should be.
+    return result
+
+    
+# x[0] is speed, x[1] is control, x[2] is gradient force, x[3] is energy
+def fx(x, dt, train, r):
+    m = train["Train mass (tonnes)"] * 1000
+    xout = np.empty_like(x)
+    v = x[0]
+    u = x[1]
+    g = x[2]
+    e = x[3]
+
+    if v > 10:
+        xout[0] = v + (p(u) / v - r(train, v) + g) * dt / m      
+        if u > 0.0001: # This ensures that very small fluctuations in u during coasting don't contribute to energy accumulation, 
+            # Only accumulate energy if u > 0 (powering)
+            xout[3] = e + p(u) * dt
+        else:
+            # No change in energy when u <= 0 (dynamic braking or idle)
+            xout[3] = e
+    else:
+        xout[0] = v + (p(u) / 10 - r(train, v) + g) * dt / m
+        if u > 0.0001:
+            # At low speeds, energy scales with velocity
+            xout[3] = e + p(u) * v / 10 * dt
+        else:
+            # No change in energy when u <= 0
+            xout[3] = e
+
+
+    xout[1] = u
+    xout[2] = g
+
+    return xout
+
+# observation is speed, control, and gradient force
+def hx(x):
+    return [x[0], x[1], x[2]]
+
+
+# Unscented Kalman Filter Function
+def apply_ukf_to_journey(log_data, train):
+    # Extract relevant columns
+    zs = log_data[["Loco speed (m/s)", "Control", "G(x)", "Energymiser Energy (J)", "TIN Energy (J)"]]
+
+    # UKF setup
+    """  
+    **n: Dimension of the state vector (here 4: speed, control, gradient, energy)
+        - For the UKF, typically generate 2n + 1 sigma points.
+
+    **alpha**: (scaling parameter, range 0 < alpha < 1)
+        - Controls the **spread** of sigma points around the mean.
+        - Typically set to a small value (e.g., 1e-3), If notice sigma points not capturing enough variation (e.g., during sharp turns in a trajectory), increase it slightly.
+        - Adjust this if find that sigma points are not capturing enough variability (increase) or are spreading too far (decrease).
+    
+    **beta**: (incorporation of prior knowledge about the state distribution)
+        - Incorporates knowledge about the shape of the distribution.
+        - For Gaussian distributions, set **beta = 2**.
+        - Only change this if the distribution deviates significantly from Gaussian.
+    
+    **kappa**: (Secondary scaling parameter)
+        - help fine-tunes the sigma points' spread.
+        - κ can control the scaling of sigma points relative to the mean.
+        - Usually set to 0, but can be adjusted if needed for further tuning (use small positive/negative values).
+    """
+    dt = 1  
+    sigmas = MerweScaledSigmaPoints(n=4, alpha=1e-3, beta=2, kappa=0)
+    ukf = UnscentedKalmanFilter(dim_x=4, dim_z=3, dt=dt, hx=hx, fx=lambda x, dt: fx(x, dt, train, r), points=sigmas)
+
+    # Initial state
+    ukf.x = np.array([zs.at[0, "Loco speed (m/s)"], zs.at[0, "Control"], zs.at[0, "G(x)"], zs.at[0, "Energymiser Energy (J)"]])   # base on Energymiser only
+  
+    # UKF parameters 
+    ukf.R = np.diag([0.1, 1, 1]) # without control observation, set ukf.R = np.diag([0.1, 0.1, 1]) if including control observation into model.
+    ukf.Q = np.diag([0.01, 0.01, 1, 10]) 
+    
+
+    # Run the UKF for each time step
+    uxs = []
+    for _, z in zs.iterrows():
+        ukf.predict()
+        ukf.update(z.values[:3])  # Only the first 3 elements are passed to update
+        uxs.append(ukf.x.copy())
+        #print("New state:", ukf.x)
+
+    return np.array(uxs)
+
+
+
+# Plot the UKF results for a journey
+def plot_ukf_results(zs, uxs, journey_name):
+    plt.figure(figsize=(15, 15))
+
+    # Plot Loco speed and UKF speed
+    plt.subplot(4, 1, 1)
+    plt.plot(zs["Loco speed (m/s)"], color='black', label="Observed speed (m/s)")
+    plt.plot(uxs[:, 0], color='green', label="UKF speed (m/s)")
+    plt.legend()
+    plt.ylabel('Speed (m/s)')
+    plt.title(f'Loco Speed and UKF Speed - {journey_name}')
+
+    # Plot Loco control and UKF control
+    plt.subplot(4, 1, 2)
+    plt.plot(zs["Control"], color='green', label="Observed Control")
+    plt.plot(uxs[:, 1], color='orange', label="UKF control")
+    plt.legend()
+    plt.ylabel('Control')
+
+    # Plot Gradient force
+    plt.subplot(4, 1, 3)
+    plt.plot(zs["G(x)"] / 1000, color='green', label="Observed Gradient force (kN)")
+    plt.plot(uxs[:, 2] / 1000, color='red', label="UKF Gradient force (kN)")
+    plt.legend()
+    plt.ylabel('Gradient force (kN)')
+
+    # Plot Energy
+    plt.subplot(4, 1, 4)
+    plt.plot(zs["Energymiser Energy (J)"], color='purple', label="Energymiser Energy (J)")
+    plt.plot(zs["TIN Energy (J)"], color='blue', label="TIN Energy (J)")
+    plt.plot(uxs[:, 3], color='red', label="UKF Energy (J)")
+    plt.legend()
+    plt.ylabel('Energy (J)')
+    plt.xlabel('Time (s)')
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+# Process each journey
+def process_journey(train):
+
+        # Construct the elevation file path for each RouteID
+        elevation_file_path = f"../data/elevation/{train['RouteID']}_elevation.tsv"
+
+        # Read the elevation data
+        elevation_data = pd.read_csv(elevation_file_path, delimiter="\t")
+
+        # Construct the log file path for each Journey
+        log_file_path = f"../data/combined logs/{train['Journey']}.tsv"
+
+
+        # Read the log data
+        log_data = pd.read_csv(log_file_path, delimiter="\t")
+
+        # Interpolate elevation data for the distances in the log
+        log_data["Elevation (m)"] = np.interp(
+            log_data["Distance (km)"], 
+            elevation_data["Distance (km)"], 
+            elevation_data["Elevation (m)"]
+        )
+
+        log_data["Energymiser speed (m/s)"] = log_data["Energymiser speed (km/h)"] / 3.6
+        log_data["Loco speed (m/s)"] = log_data["Loco speed (km/h)"] / 3.6
+        log_data["Control"] = log_data.apply(lambda row: -row["Dynamic brake"] if row["Dynamic brake"] > 0 else row["Notch"] / 8, axis=1)
+        
+        # Calculate gradient force for each row 
+        log_data["G(x)"] = log_data["Distance (km)"].apply(lambda xf: gradient_force(xf, log_data, train))
+        log_data["R(v)"] = log_data["Energymiser speed (km/h)"] / 3.6
+
+        # Add TIN Energy 
+        
+        TIN_power = log_data["Notch"].map(lambda n: nlocos*notch_power[n])
+        log_data["TIN Energy (J)"] = TIN_power.cumsum(axis=0) #numpy.cumsum() Return the cumulative sum of the elements along a given axis.
+        log_data.loc[0, "TIN Energy (J)"] = 0  
+        e0 = log_data.loc[0, "Energy (J)"] 
+        log_data["Energymiser Energy (J)"]  = log_data["Energy (J)"] - e0      
+
+        return log_data
+
+
+"""
+1. Process each journey to extract the necessary data.
+2. Apply the UKF to this data inside the same loop.
+3. Plot the results for each journey once the UKF has been applied.
+
+"""
+
+# Process all journeys
+for i, train in trains.iterrows():
+    nlocos = 1 if train["Power (kW)"] < 2500 else 2
+    # Skip RouteID 429 before doing anything else
+    if train["RouteID"] != 429:
+          
+          # Process each journey
+          processed_log = process_journey(train)
+
+          # Apply UKF to the processed log data
+          ukf_results = apply_ukf_to_journey(processed_log, train)
+          plot_ukf_results(processed_log, ukf_results, train["Journey"])
+          print(f'{train["Journey"]}\tEnergymiser Energy: {processed_log["Energymiser Energy (J)"].iloc[-1]/1e9:0.2f}\tTIN Energy: {processed_log["TIN Energy (J)"].iloc[-1]/1e9:0.2f}\tUKF Energy: {ukf_results[-1, 3]/1e9:0.2f}')
+          
+          
